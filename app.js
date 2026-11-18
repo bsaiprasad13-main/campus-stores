@@ -67,18 +67,21 @@
   const shifts = [
     {
       time: "Friday · 3:45 pm",
+      at: 945,
       title: "Pickup at the counter",
       text: "Kabir is here for the Film Society screening. The film starts at four. Can he leave with everything he needs?",
       next: "Move to return time",
     },
     {
       time: "Friday · 7:30 pm",
+      at: 1170,
       title: "The kit comes back in pieces",
       text: "Kabir has brought back the projector and speaker. “Leela still has the adapter. She’ll drop it off tomorrow at nine.” Take the return and hand over to the morning shift.",
       next: "Move to next morning",
     },
     {
       time: "Saturday · 9:00 am",
+      at: 1980,
       title: "Morning shift",
       text: "You’ve just taken over. Leela walks in with an adapter. Work out what was outstanding from the screening and close the loan for the right item.",
     },
@@ -88,6 +91,34 @@
     ["Inventory", "package"],
     ["Loan register", "book-open"],
     ["Desk book", "messages-square"],
+  ];
+  // Desk book messages, with desk-clock minutes from Friday 00:00 so the handover
+  // drafter can read them alongside the slips.
+  const messages = [
+    {
+      phase: 0,
+      at: 920,
+      time: "Friday · 3:20 pm",
+      author: "Isha Rao",
+      club: "Film Society",
+      text: "Kabir Sen is picking up our whole screening kit. Please issue it in his name. I’m setting up in the courtyard.",
+    },
+    {
+      phase: 0,
+      at: 930,
+      time: "Friday · 3:30 pm",
+      author: "Tara Shah",
+      club: "Debate Union",
+      text: "Our microphone stays with me overnight. I’ll return it by 10 am Saturday.",
+    },
+    {
+      phase: 1,
+      at: 1170,
+      time: "Friday · 7:30 pm",
+      author: "Kabir Sen",
+      club: "Film Society",
+      text: "I brought the projector and speaker. Leela Das has our adapter. She’ll be at the counter at 9 am tomorrow.",
+    },
   ];
   const original = () => ({
     version: 1,
@@ -106,6 +137,7 @@
       },
     ],
     notes: [],
+    handovers: [],
     editing: false,
     onlyOpen: true,
     notice: "Sample shift · All records are fictional.",
@@ -114,6 +146,55 @@
   const getAsset = (id) => assets.find((x) => x.id === id);
   const getReq = (id) => requests.find((x) => x.id === id);
   const out = (id) => s.loans.find((l) => l.asset === id && !l.back);
+  const getLoan = (num) => s.loans.find((l) => l.num === Number(num));
+  const seenMessages = () => messages.filter((m) => m.phase <= s.phase);
+  // The drafter sees only the desk's records: slips, units, requests and messages so far.
+  const draftNow = () =>
+    CampusHandover.draftHandover({
+      now: shifts[s.phase].at,
+      handoverTo: (shifts[s.phase + 1] || shifts[s.phase]).at,
+      loans: s.loans.map((l) => ({
+        ...l,
+        backAt: !l.back
+          ? undefined
+          : shifts[l.backAt]
+            ? shifts[l.backAt].at
+            : Infinity,
+      })),
+      assets,
+      requests,
+      people,
+      messages: seenMessages(),
+    });
+  const flagLabels = {
+    "closed-but-out": () => ["Slip closed, item still out", "late"],
+    "said-returned": () => ["Said returned, slip open", "late"],
+    late: () => ["Overdue", "late"],
+    "holder-differs": (it) => ["Now with " + it.holder, "soon"],
+    arriving: (it) => ["Back " + it.expected, "soon"],
+    "look-alike": (it) => [
+      it.bin ? "Look-alike in bin " + it.bin : "Look-alike in the same bin",
+      "plain",
+    ],
+  };
+  const chips = (it) =>
+    '<div class="chips">' +
+    it.flags
+      .filter((f) => f !== "arriving") // the next-step line already gives the time
+      .map((f) => {
+        const [text, tone] = Object.hasOwn(flagLabels, f)
+          ? flagLabels[f](it)
+          : [f, "plain"];
+        return '<span class="tag ' + tone + '">' + esc(text) + "</span>";
+      })
+      .join("") +
+    "</div>";
+  const resolved = (it) => {
+    if (it.done) return true;
+    const l = getLoan(it.slip);
+    return !it.flags.includes("closed-but-out") && (!l || l.back);
+  };
+  const openCount = (h) => h.items.filter((it) => !resolved(it)).length;
   const esc = (x) =>
     String(x).replace(
       /[&<>"']/g,
@@ -265,6 +346,7 @@
       );
     }
     html +=
+      handoverHint() +
       '<div class="buttons">' +
       ["Outstanding", "All slips"]
         .map(
@@ -295,28 +377,14 @@
     return html;
   }
   function deskbook() {
-    let html = head(
-      "Desk book",
-      "Messages from clubs and notes for the next shift",
-    );
-    const entries = [
-      [
-        "Friday · 3:20 pm",
-        "Isha Rao · Film Society",
-        "Kabir Sen is picking up our whole screening kit. Please issue it in his name. I’m setting up in the courtyard.",
-      ],
-      [
-        "Friday · 3:30 pm",
-        "Tara Shah · Debate Union",
-        "Our microphone stays with me overnight. I’ll return it by 10 am Saturday.",
-      ],
-    ];
-    if (s.phase >= 1)
-      entries.push([
-        "Friday · 7:30 pm",
-        "Kabir Sen · Film Society",
-        "I brought the projector and speaker. Leela Das has our adapter. She’ll be at the counter at 9 am tomorrow.",
-      ]);
+    let html =
+      head("Desk book", "Messages from clubs and handovers between shifts") +
+      handoverPanel();
+    const entries = seenMessages().map((m) => [
+      m.time,
+      m.author + " · " + m.club,
+      m.text,
+    ]);
     for (const n of s.notes)
       entries.push([shifts[n.phase].time, "Counter handover", n.text]);
     for (const [t, author, body] of entries.slice().reverse())
@@ -328,9 +396,144 @@
         "</h3><p>" +
         esc(body) +
         "</p></article>";
+    return html;
+  }
+  // What the handover needs right now: lines still open from the last shift, or a
+  // draft this shift has not signed. Drives the register hint and the tab count.
+  function handoverNeeds() {
+    const h = s.handovers.filter((x) => x.phase < s.phase).pop();
+    const open = h ? openCount(h) : 0;
+    if (open) return { open, from: shifts[h.phase].time };
+    const signed = s.handovers.some((x) => x.phase === s.phase);
+    if (s.phase > 0 && shifts[s.phase].next && !signed)
+      return { unsigned: draftNow().length };
+    return null;
+  }
+  function handoverHint() {
+    const need = handoverNeeds();
+    if (!need) return "";
+    const plural = (n) => n + (n === 1 ? " item" : " items");
+    const text = need.open
+      ? "Handover from " + need.from + ": " + plural(need.open) + " still open."
+      : "Handover not signed yet: " + plural(need.unsigned) + " drafted from the records.";
+    return (
+      '<p class="hint">' +
+      esc(text) +
+      btn("Open handover", "tab", "Desk book") +
+      "</p>"
+    );
+  }
+  function deskCount() {
+    const need = handoverNeeds();
+    const n = need ? need.open || need.unsigned : 0;
+    return n
+      ? '<span class="count">' + n + '<span class="sr"> handover items</span></span>'
+      : "";
+  }
+  // The next step comes first. The records behind it stay in view while the clerk
+  // checks the draft, and fold away once the handover is signed.
+  function handoverItem(it, extra, folded) {
+    const records =
+      '<ul class="evidence">' +
+      it.text.map((t) => "<li>" + esc(t) + "</li>").join("") +
+      "</ul>";
+    return (
+      (it.action ? '<p class="action">' + esc(it.action) + "</p>" : "") +
+      chips(it) +
+      (it.note
+        ? '<p class="clerknote"><b>Clerk’s note:</b> ' + esc(it.note) + "</p>"
+        : "") +
+      (folded
+        ? '<details class="why"><summary>Records behind this (' +
+          it.text.length +
+          ")</summary>" +
+          records +
+          "</details>"
+        : records) +
+      extra
+    );
+  }
+  // A signed handover stays live: each line closes itself when its slip closes.
+  function handoverCard(h, title) {
+    const hi = s.handovers.indexOf(h);
+    const open = openCount(h);
+    let html =
+      '<div class="record handover"><small>' +
+      esc(title) +
+      "</small><h3>" +
+      esc(
+        h.items.length
+          ? open + " of " + h.items.length + " still open"
+          : "Nothing was outstanding",
+      ) +
+      "</h3>";
+    h.items.forEach((it, i) => {
+      const l = getLoan(it.slip);
+      const done = resolved(it);
+      const action = done
+        ? badge(it.done ? "Checked" : "Slip closed", true)
+        : l && !l.back
+          ? btn("Record return of " + l.asset, "return", String(l.num), "primary")
+          : btn("Mark checked", "hdone", hi + ":" + i);
+      html +=
+        '<div class="hitem' +
+        (done ? " done" : "") +
+        '"><strong>' +
+        esc(it.title) +
+        "</strong>" +
+        handoverItem(it, action, true) +
+        "</div>";
+    });
+    if (h.extra) html += "<p><b>Also:</b> " + esc(h.extra) + "</p>";
+    return html + "</div>";
+  }
+  // The outgoing clerk checks a draft built from the records instead of a blank box.
+  function handoverPanel() {
+    const received = s.handovers.filter((h) => h.phase < s.phase).pop();
+    const html = received
+      ? handoverCard(received, "Handover from " + shifts[received.phase].time)
+      : "";
+    const mine = s.handovers.find((h) => h.phase === s.phase);
+    if (mine)
+      return (
+        html +
+        handoverCard(mine, "Your handover · signed off " + shifts[mine.phase].time)
+      );
+    if (s.phase === 0)
+      return (
+        html +
+        '<p class="hint">At the end of the shift, the handover is drafted here from the records for you to check.</p>'
+      );
+    const items = draftNow();
+    let form =
+      '<form data-handover class="record handover"><small>Drafted from the loan register and ' +
+      seenMessages().length +
+      " desk book messages · tick each line once you have checked it</small><h3>Handover for the next shift</h3>";
+    if (!items.length) form += "<p>The records show nothing outstanding.</p>";
+    items.forEach((it, i) => {
+      form +=
+        '<div class="hitem"><label class="hcheck"><input type="checkbox" name="ok' +
+        i +
+        '" required /><strong>' +
+        esc(it.title) +
+        "</strong></label>" +
+        handoverItem(
+          it,
+          '<input name="note' +
+            i +
+            '" maxlength="200" autocomplete="off" placeholder="Add or correct something (optional)" />',
+        ) +
+        "</div>";
+    });
+    form +=
+      '<label class="full"><span>Anything else the next shift should know?</span><textarea name="extra" rows="2" maxlength="400"></textarea></label><button type="submit" class="primary">Sign off handover</button></form>';
     return (
       html +
-      '<form data-note><div class="form"><label class="full"><span>Note for the next shift</span><textarea name="note" rows="2" maxlength="400" required></textarea></label></div><button type="submit">Add handover note</button></form>'
+      (received
+        ? '<details class="later"><summary>Draft your own handover</summary>' +
+          form +
+          "</details>"
+        : form)
     );
   }
   const screens = {
@@ -358,6 +561,7 @@
           icon +
           '"></use></svg>' +
           n +
+          (n === "Desk book" ? deskCount() : "") +
           "</button>",
       )
       .join("");
@@ -406,10 +610,19 @@
       case "scope":
         s.onlyOpen = v === "0";
         break;
+      case "hdone": {
+        const [hi, ii] = String(v).split(":").map(Number);
+        const it = s.handovers[hi] && s.handovers[hi].items[ii];
+        if (!it) return;
+        it.done = true;
+        s.notice = "Handover item marked checked.";
+        break;
+      }
       case "return": {
         const l = s.loans.find((l) => l.num === Number(v));
         if (!l || l.back) return;
         l.back = true;
+        l.backAt = s.phase;
         s.notice = l.asset + " returned to stock. Slip L-" + l.num + " closed.";
         break;
       }
@@ -426,11 +639,26 @@
     e.preventDefault();
     const f = e.target;
     const form = new FormData(f);
-    if (f.matches("[data-note]")) {
-      const text = String(form.get("note")).trim();
-      if (!text) return;
-      s.notes.push({ phase: s.phase, text });
-      commit("Handover note saved.");
+    if (f.matches("[data-handover]")) {
+      if (s.handovers.some((h) => h.phase === s.phase)) return;
+      const items = draftNow().map((it, i) => ({
+        ...it,
+        note: String(form.get("note" + i) || "")
+          .trim()
+          .slice(0, 200),
+      }));
+      s.handovers.push({
+        phase: s.phase,
+        items,
+        extra: String(form.get("extra") || "")
+          .trim()
+          .slice(0, 400),
+      });
+      commit(
+        "Handover signed off with " +
+          items.length +
+          (items.length === 1 ? " item." : " items."),
+      );
       return;
     }
     if (!f.matches("[data-issue]")) return;
@@ -460,6 +688,18 @@
     s.editing = false;
     commit("Issued " + asset + " to " + who + " on slip L-" + num + ".");
   });
+  const validHandover = (h) =>
+    h &&
+    shifts[h.phase] &&
+    typeof (h.extra || "") === "string" &&
+    Array.isArray(h.items) &&
+    h.items.every(
+      (it) =>
+        it &&
+        typeof it.title === "string" &&
+        Array.isArray(it.text) &&
+        Array.isArray(it.flags),
+    );
   function restore(d) {
     if (
       !d ||
@@ -482,6 +722,10 @@
     s = {
       ...original(),
       ...d,
+      handovers: (Array.isArray(d.handovers)
+        ? d.handovers.filter(validHandover)
+        : []
+      ).map((h) => ({ ...h, items: h.items.map((it) => ({ ...it })) })),
       loans: d.loans.map((l) => ({ ...l })),
       notes: d.notes.map((n) => ({ ...n })),
     };
